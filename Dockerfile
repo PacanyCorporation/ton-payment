@@ -25,11 +25,3 @@ COPY --from=builder /go/pkg/mod/github.com/tonkeeper/tongo*/lib/linux /app/lib/
 ENV LD_LIBRARY_PATH=/app/lib
 COPY --from=builder /tmp/processor /app/processor
 CMD ["/app/processor", "-v"]
-
-FROM docker.io/library/ubuntu:24.04 AS payment-test
-RUN apt-get update && apt-get install -y openssl ca-certificates libsodium23 wget && rm -rf /var/lib/apt/lists/*
-RUN mkdir -p /app/lib
-COPY --from=builder /go/pkg/mod/github.com/tonkeeper/tongo*/lib/linux /app/lib/
-ENV LD_LIBRARY_PATH=/app/lib
-COPY --from=builder /tmp/testutil /app/testutil
-CMD ["/app/testutil", "-v"]
