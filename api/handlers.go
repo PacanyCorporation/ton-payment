@@ -404,7 +404,7 @@ func (h *Handler) getMetrics(resp http.ResponseWriter, req *http.Request) {
 			return
 		}
 	}
-	resp.Header().Add("Content-Type", "application/text")
+	resp.Header().Add("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	resp.WriteHeader(http.StatusOK)
 	_, err := resp.Write(buf.Bytes())
 	if err != nil {
