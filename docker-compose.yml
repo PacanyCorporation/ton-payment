@@ -2,21 +2,22 @@ version: '3'
 
 services:
 
-  payment-postgres:
-    image: postgres:14
-    container_name: payment_processor_db
-    volumes:
-    - ./deploy/db/01_init.up.sql:/docker-entrypoint-initdb.d/01_init.up.sql
-    - ./deploy/db/02_create_readonly_user.sh:/docker-entrypoint-initdb.d/02_create_readonly_user.sh
-    - bicycle-postgres:/var/lib/postgresql/data
-    restart: always
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_READONLY_PASSWORD: ${POSTGRES_READONLY_PASSWORD} # For grafana
-    networks:
-      - p-network
+  # Закомментировано - используем вашу существующую БД durak-postgres
+  # payment-postgres:
+  #   image: postgres:14
+  #   container_name: payment_processor_db
+  #   volumes:
+  #   - ./deploy/db/01_init.up.sql:/docker-entrypoint-initdb.d/01_init.up.sql
+  #   - ./deploy/db/02_create_readonly_user.sh:/docker-entrypoint-initdb.d/02_create_readonly_user.sh
+  #   - bicycle-postgres:/var/lib/postgresql/data
+  #   restart: always
+  #   environment:
+  #     POSTGRES_DB: ${POSTGRES_DB}
+  #     POSTGRES_USER: ${POSTGRES_USER}
+  #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  #     POSTGRES_READONLY_PASSWORD: ${POSTGRES_READONLY_PASSWORD} # For grafana
+  #   networks:
+  #     - p-network
 
   payment-processor:
     image: payment-processor
@@ -25,7 +26,7 @@ services:
       - "127.0.0.1:8081:${API_PORT}"
     restart: unless-stopped
     environment:
-      DB_URI: ${DB_URI} # example: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@payment_processor_db:5432/${POSTGRES_DB}"
+      DB_URI: ${DB_URI} # Подключается к durak-postgres
       API_PORT: ${API_PORT}
       API_TOKEN: ${API_TOKEN}
       COLD_WALLET: ${COLD_WALLET}
@@ -37,6 +38,9 @@ services:
       IS_TESTNET: ${IS_TESTNET}
     networks:
       - p-network
+      - durak-network-dev  # Подключаемся к вашей сети для доступа к durak-postgres
+    depends_on:
+      - durak-postgres  # Ждем запуска вашей БД
 
   payment-grafana:
     image: grafana/grafana:latest
@@ -80,6 +84,11 @@ services:
 networks:
   p-network:
     driver: bridge
+  # Подключаемся к вашим существующим сетям
+  durak-network-dev:
+    external: true
+  durak-network-prod:
+    external: true
 
 volumes:
   bicycle-postgres:

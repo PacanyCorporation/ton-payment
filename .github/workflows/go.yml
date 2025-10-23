@@ -1,71 +1,54 @@
-name: Go
+permissions:
+  packages: write
+  contents: read
+
+name: Deploy docker image
 
 on:
   push:
-    branches: [ "master" ]
-  pull_request:
-    branches: [ "master" ]
+    branches: [main, dev]
 
 jobs:
-  build:
-    runs-on: ubuntu-24.04
-    environment: TESTS
-    services:
-      postgres:
-        image: postgres
-        env:
-          POSTGRES_DB: payment_processor
-          POSTGRES_USER: pp_user
-          POSTGRES_PASSWORD: postgres
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
+  deploy:
+    runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v3
-        with:
-          persist-credentials: false # otherwise, the token used is the GITHUB_TOKEN, instead of your personal access token.
-          fetch-depth: 0 # otherwise, there would be errors pushing refs to the destination repository.
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v3
-        with:
-          go-version: 1.23.0
-
-      - name: Build
-        run: go build -v ./...
-
-      - uses: actions/cache@v4
-        with:
-          path: ~/go/pkg/mod
-          key: ${{ runner.os }}-2go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-2go-
-
-      - name: Install dependencies
+      - name: Set variables
+        id: vars
         run: |
-          sudo apt-get update
-          sudo apt-get -y install openssl ca-certificates libsodium23
+          BRANCH_NAME=${GITHUB_REF#refs/heads/}
+          REPO_NAME=$(basename "$GITHUB_REPOSITORY")
+          REPO_NAME_LOWER=$(echo "$REPO_NAME" | tr '[:upper:]' '[:lower:]')
 
-      - name: Install libs
+          echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
+          echo "REPO_NAME=$REPO_NAME_LOWER" >> $GITHUB_ENV
+
+          if [[ "$BRANCH_NAME" == "main" ]]; then
+            echo "TAG=latest" >> $GITHUB_ENV
+          elif [[ "$BRANCH_NAME" == "dev" ]]; then
+            echo "TAG=dev" >> $GITHUB_ENV
+          else
+            echo "Unsupported branch: $BRANCH_NAME"
+            exit 1
+          fi
+
+      - name: Log in to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Set up SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
         run: |
-          wget -O libemulator.so https://github.com/ton-blockchain/ton/releases/download/v2025.06/libemulator-linux-x86_64.so
-          sudo cp libemulator.so /lib
-
-      - name: Update Library Cache
-        run: sudo ldconfig
-
-      - name: Verify Library Presence
-        run: ls /lib | grep libemulator.so
-
-      - name: Run Test
-        env:
-          SEED: ${{ secrets.SEED }}
-          SERVER: ${{ secrets.SERVER }}
-          KEY: ${{ secrets.KEY }}
-          DB_URI: postgresql://pp_user:postgres@localhost:5432/payment_processor?sslmode=disable
-        run: |
-          go test -v $(go list ./...)
+          REPO_LOWER="${GITHUB_REPOSITORY,,}"
+          IMAGE=ghcr.io/$REPO_LOWER:${TAG}
+          DOCKER_BUILDKIT=1 docker build --ssh default -t $IMAGE .
+          docker push $IMAGE
