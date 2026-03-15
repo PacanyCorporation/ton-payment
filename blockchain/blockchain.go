@@ -59,7 +59,13 @@ func NewConnection(addr, key string, rateLimit int) (*Connection, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*120)
 	defer cancel()
 
-	err := client.AddConnection(ctx, addr, key)
+	var err error
+	if config.Config.LiteServersConfigURL != "" {
+		log.Infof("Loading liteservers from config: %s", config.Config.LiteServersConfigURL)
+		err = client.AddConnectionsFromConfigUrl(ctx, config.Config.LiteServersConfigURL)
+	} else {
+		err = client.AddConnection(ctx, addr, key)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("connection err: %v", err.Error())
 	}

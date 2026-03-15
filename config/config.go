@@ -38,8 +38,9 @@ const JettonProxyContractCode = "B5EE9C72410102010037000114FF00F4A413F4BCF2C80B0
 const MaxCommentLength = 1000 // qty in chars
 
 var Config = struct {
-	LiteServer               string `env:"LITESERVER,required"`
-	LiteServerKey            string `env:"LITESERVER_KEY,required"`
+	LiteServersConfigURL     string `env:"LITESERVERS_CONFIG_URL"`
+	LiteServer               string `env:"LITESERVER"`
+	LiteServerKey            string `env:"LITESERVER_KEY"`
 	LiteServerRateLimit      int    `env:"LITESERVER_RATE_LIMIT" envDefault:"100"`
 	Seed                     string `env:"SEED,required"`
 	DatabaseURI              string `env:"DB_URI,required"`
@@ -83,6 +84,12 @@ func GetConfig() {
 	err := env.Parse(&Config)
 	if err != nil {
 		log.Fatalf("Can not load config: %v", err)
+	}
+	if Config.LiteServersConfigURL == "" && (Config.LiteServer == "" || Config.LiteServerKey == "") {
+		log.Fatalf("Either LITESERVERS_CONFIG_URL or both LITESERVER and LITESERVER_KEY must be set")
+	}
+	if Config.NetworkConfigUrl == "" && Config.LiteServersConfigURL != "" {
+		Config.NetworkConfigUrl = Config.LiteServersConfigURL
 	}
 	Config.Jettons = parseJettonString(Config.JettonString)
 	Config.Ton = parseTonString(Config.TonString)
