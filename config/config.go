@@ -41,7 +41,7 @@ var Config = struct {
 	LiteServersConfigURL     string `env:"LITESERVERS_CONFIG_URL"`
 	LiteServer               string `env:"LITESERVER"`
 	LiteServerKey            string `env:"LITESERVER_KEY"`
-	LiteServerRateLimit      int    `env:"LITESERVER_RATE_LIMIT" envDefault:"100"`
+	LiteServerRateLimit      int    `env:"LITESERVER_RATE_LIMIT" envDefault:"20"`
 	Seed                     string `env:"SEED,required"`
 	DatabaseURI              string `env:"DB_URI,required"`
 	APIPort                  int    `env:"API_PORT,required"`

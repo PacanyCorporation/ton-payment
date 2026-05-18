@@ -70,7 +70,7 @@ func NewConnection(addr, key string, rateLimit int) (*Connection, error) {
 		return nil, fmt.Errorf("connection err: %v", err.Error())
 	}
 
-	limitedClient := newLimitedClient(client, rateLimit)
+	limitedClient := newRetryableClient(client, rateLimit, 5)
 
 	var wrappedClient ton.APIClientWrapped
 

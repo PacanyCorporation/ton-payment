@@ -90,7 +90,9 @@ func (s *BlockScanner) Start() {
 	for {
 		block, exit, err := s.tracker.NextBlock()
 		if err != nil {
-			log.Fatalf("get block error: %v", err)
+			log.Errorf("get block error: %v", err)
+			time.Sleep(time.Second * 5)
+			continue
 		}
 		if exit {
 			log.Printf("Block scanner stopped")
@@ -99,7 +101,10 @@ func (s *BlockScanner) Start() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*15)
 		err = s.processBlock(ctx, block)
 		if err != nil {
-			log.Fatalf("block processing error: %v", err)
+			log.Errorf("block processing error: %v", err)
+			cancel()
+			time.Sleep(time.Second * 5)
+			continue
 		}
 		cancel()
 	}
