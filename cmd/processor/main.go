@@ -100,9 +100,16 @@ func main() {
 	apiMux := http.NewServeMux()
 	h := api.NewHandler(dbClient, bcClient, config.Config.APIToken, wallets.Shard, *wallets.TonHotWallet.Address())
 	api.RegisterHandlers(apiMux, h)
+	srv := &http.Server{
+		Addr:              fmt.Sprintf(":%d", config.Config.APIPort),
+		Handler:           apiMux,
+		ReadTimeout:       15 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	go func() {
-		err := http.ListenAndServe(fmt.Sprintf(":%d", config.Config.APIPort), apiMux)
-		if err != nil {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("api error: %v", err)
 		}
 	}()
@@ -112,6 +119,12 @@ func main() {
 		log.Printf("SIGTERM received")
 		blockScanner.Stop()
 		withdrawalsProcessor.Stop()
+		// Drain in-flight API requests before exit.
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer shutdownCancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Errorf("api server shutdown error: %v", err)
+		}
 	}()
 
 	wg.Wait()

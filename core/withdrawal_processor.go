@@ -81,49 +81,54 @@ func (p *WithdrawalsProcessor) startWithdrawalsProcessor() {
 			break
 		}
 		time.Sleep(config.ExternalWithdrawalPeriod)
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second*25) // must be < ExternalWithdrawalPeriod
-		err := p.makeColdWalletWithdrawals(ctx)
-		if err != nil {
-			log.Fatalf("make withdrawals to cold wallet error: %v\n", err)
+		// A transient DB/RPC error must not crash the whole processor: log and
+		// retry next round. Withdrawals persisted this round carry a TTL, so an
+		// interrupted round is recovered by the expiration processor.
+		if err := p.processExternalWithdrawalsRound(); err != nil {
+			log.Errorf("external withdrawals round error: %v", err)
 		}
-		w, err := p.buildWithdrawalMessages(ctx)
-		if err != nil {
-			log.Fatalf("make withdrawal messages error: %v\n", err)
-		}
-		if len(w.Messages) == 0 {
-			cancel()
-			continue
-		}
-		extMsg, err := p.wallets.TonHotWallet.BuildExternalMessageForMany(ctx, w.Messages)
-		if err != nil {
-			log.Fatalf("build hotwallet external msg error: %v\n", err)
-		}
-		info, err := getHighLoadWalletExtMsgInfo(extMsg)
-		if err != nil {
-			log.Fatalf("get external message uuid error: %v\n", err)
-		}
-		err = p.db.CreateExternalWithdrawals(ctx, w.External, info.UUID, info.TTL)
-		if err != nil {
-			log.Fatalf("save external withdrawals error: %v\n", err)
-		}
-		for _, sw := range w.Service {
-			err = p.db.UpdateServiceWithdrawalRequest(ctx, sw.Task, sw.TonAmount, info.TTL, sw.Filled)
-			if err != nil {
-				log.Fatalf("update service withdrawal error: %v\n", err)
-			}
-		}
-		for _, iw := range w.Internal {
-			err = p.db.SaveInternalWithdrawalTask(ctx, iw.Task, info.TTL, iw.Memo)
-			if err != nil {
-				log.Fatalf("save internal withdrawal error: %v\n", err)
-			}
-		}
-		err = p.bc.SendExternalMessage(ctx, extMsg)
-		if err != nil {
-			log.Errorf("send external msg error: %v\n", err)
-		}
-		cancel()
 	}
+}
+
+func (p *WithdrawalsProcessor) processExternalWithdrawalsRound() error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*25) // must be < ExternalWithdrawalPeriod
+	defer cancel()
+
+	if err := p.makeColdWalletWithdrawals(ctx); err != nil {
+		return fmt.Errorf("make withdrawals to cold wallet: %w", err)
+	}
+	w, err := p.buildWithdrawalMessages(ctx)
+	if err != nil {
+		return fmt.Errorf("make withdrawal messages: %w", err)
+	}
+	if len(w.Messages) == 0 {
+		return nil
+	}
+	extMsg, err := p.wallets.TonHotWallet.BuildExternalMessageForMany(ctx, w.Messages)
+	if err != nil {
+		return fmt.Errorf("build hotwallet external msg: %w", err)
+	}
+	info, err := getHighLoadWalletExtMsgInfo(extMsg)
+	if err != nil {
+		return fmt.Errorf("get external message uuid: %w", err)
+	}
+	if err := p.db.CreateExternalWithdrawals(ctx, w.External, info.UUID, info.TTL); err != nil {
+		return fmt.Errorf("save external withdrawals: %w", err)
+	}
+	for _, sw := range w.Service {
+		if err := p.db.UpdateServiceWithdrawalRequest(ctx, sw.Task, sw.TonAmount, info.TTL, sw.Filled); err != nil {
+			return fmt.Errorf("update service withdrawal: %w", err)
+		}
+	}
+	for _, iw := range w.Internal {
+		if err := p.db.SaveInternalWithdrawalTask(ctx, iw.Task, info.TTL, iw.Memo); err != nil {
+			return fmt.Errorf("save internal withdrawal: %w", err)
+		}
+	}
+	if err := p.bc.SendExternalMessage(ctx, extMsg); err != nil {
+		log.Errorf("send external msg error: %v", err)
+	}
+	return nil
 }
 
 func (p *WithdrawalsProcessor) buildWithdrawalMessages(ctx context.Context) (withdrawals, error) {
@@ -460,7 +465,7 @@ func (p *WithdrawalsProcessor) startExpirationProcessor() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*3) // must be < ExpirationProcessorPeriod
 		err := p.db.SetExpired(ctx)
 		if err != nil {
-			log.Fatalf("set expired withdrawals error: %v", err)
+			log.Errorf("set expired withdrawals error: %v", err)
 		}
 		cancel()
 		time.Sleep(config.ExpirationProcessorPeriod)
@@ -479,24 +484,24 @@ func (p *WithdrawalsProcessor) startInternalTonWithdrawalsProcessor() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*120) // TODO: split context
 		serviceTasks, err := p.db.GetServiceDepositWithdrawalTasks(ctx, 5)
 		if err != nil {
-			log.Fatalf("get service withdrawal tasks error: %v", err)
+			log.Errorf("get service withdrawal tasks error: %v", err)
 		}
 		for _, task := range serviceTasks {
 			err = p.serviceWithdrawJettons(ctx, task)
 			if err != nil {
-				log.Fatalf("Jettons service internal withdrawal error: %v", err)
+				log.Errorf("Jettons service internal withdrawal error: %v", err)
 			}
 			time.Sleep(time.Millisecond * 50)
 		}
 
 		internalTasks, err := p.db.GetTonInternalWithdrawalTasks(ctx, 40) // context limitation
 		if err != nil {
-			log.Fatalf("get internal withdrawal tasks error: %v", err)
+			log.Errorf("get internal withdrawal tasks error: %v", err)
 		}
 		for _, task := range internalTasks {
 			err = p.withdrawTONsFromDeposit(ctx, task)
 			if err != nil {
-				log.Fatalf("TONs internal withdrawal error: %v", err)
+				log.Errorf("TONs internal withdrawal error: %v", err)
 			}
 			time.Sleep(time.Millisecond * 50)
 		}
@@ -589,7 +594,7 @@ func (p *WithdrawalsProcessor) waitSync() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*2)
 		isSynced, _, err := p.db.IsActualBlockData(ctx)
 		if err != nil {
-			log.Fatalf("check sync error: %v", err)
+			log.Errorf("check sync error: %v", err)
 		}
 		if isSynced {
 			cancel()

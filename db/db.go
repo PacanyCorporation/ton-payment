@@ -68,7 +68,9 @@ func (c *Connection) GetUserID(address core.Address) (string, bool) {
 func (c *Connection) GetOwner(address core.Address) *core.Address {
 	info, ok := c.addressBook.get(address)
 	if ok && info.Type == core.JettonDepositWallet && info.Owner == nil {
-		log.Fatalf("must be owner address in address book for jetton deposit")
+		// Data anomaly, but a read must not crash the whole processor. Return nil
+		// and let the caller fall back / skip.
+		log.Errorf("missing owner address in address book for jetton deposit %s", address.ToUserFormat())
 	}
 	return info.Owner
 }

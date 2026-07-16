@@ -4,9 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	log "github.com/sirupsen/logrus"
 	"net/http"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
 type Client struct {
@@ -60,9 +61,8 @@ func send(client *http.Client, request *http.Request) error {
 		return fmt.Errorf("webhook sending error: %v", err)
 	}
 	defer func() {
-		err := response.Body.Close()
-		if err != nil {
-			log.Fatalf("response body close error: %v", err)
+		if err := response.Body.Close(); err != nil {
+			log.Errorf("response body close error: %v", err)
 		}
 	}()
 	if response.StatusCode == 200 {

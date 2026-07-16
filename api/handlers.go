@@ -771,8 +771,9 @@ func convertIncome(dbConn storage, totalIncomes []core.TotalIncome) GetIncomeRes
 		} else {
 			owner := dbConn.GetOwner(b.Deposit)
 			if owner == nil {
-				// TODO: remove fatal
-				log.Fatalf("can not find owner for deposit: %s", b.Deposit.ToUserFormat())
+				// Anomaly: skip this row rather than crash the endpoint.
+				log.Errorf("can not find owner for deposit: %s, skipping", b.Deposit.ToUserFormat())
+				continue
 			}
 			totIncome.Address = owner.ToUserFormat()
 		}
@@ -793,10 +794,12 @@ func convertOneIncome(dbConn storage, currency string, oneIncome core.ExternalIn
 	} else {
 		owner := dbConn.GetOwner(oneIncome.To)
 		if owner == nil {
-			// TODO: remove fatal
-			log.Fatalf("can not find owner for deposit: %s", oneIncome.To.ToUserFormat())
+			// Anomaly: fall back to the raw deposit address rather than crash.
+			log.Errorf("can not find owner for deposit: %s, using deposit address", oneIncome.To.ToUserFormat())
+			inc.DepositAddress = oneIncome.To.ToUserFormat()
+		} else {
+			inc.DepositAddress = owner.ToUserFormat()
 		}
-		inc.DepositAddress = owner.ToUserFormat()
 	}
 	// show only std address
 	if len(oneIncome.From) == 32 && oneIncome.FromWorkchain != nil {
