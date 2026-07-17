@@ -101,13 +101,19 @@ func (s *BlockScanner) Start() {
 			break
 		}
 
-		events, saved := s.saveBlock(block)
-		if !saved {
+		events, saved, shutdown := s.saveBlock(block)
+		if shutdown {
 			// Graceful shutdown interrupted the save-retry loop. The block is left
 			// unsaved, but the tracker resumes from the last SAVED block on restart
 			// (GetLastSavedBlockID seeding in main.go), so it is reprocessed — not lost.
 			log.Printf("Block scanner stopped")
 			break
+		}
+		if !saved {
+			// Gave up on a persistently-failing block (already alerted in saveBlock).
+			// Skipping keeps the pipeline alive instead of wedging on one block; the
+			// backend deposit reconciler is the safety net for any missed income.
+			continue
 		}
 		// The block is durably saved. Notifications are best-effort: a delivery
 		// failure is recoverable by the backend deposit reconciler, which reads the
@@ -124,19 +130,31 @@ func (s *BlockScanner) Stop() {
 	s.tracker.Stop()
 }
 
+// maxBlockSaveAttempts bounds how long saveBlock retries one block. At 5s between
+// attempts this rides out ~5 min of transient DB/RPC outage before giving up.
+const maxBlockSaveAttempts = 60
+
 // saveBlock durably persists a block's parsed events, retrying the SAME block on
-// transient failure instead of skipping to the next one. The tracker has already
-// consumed this block from its in-memory buffer, so a skip would drop it forever;
-// and because incomes are saved atomically WITH the block header, a dropped block
-// means the deposit is never persisted and is unrecoverable even by reconciliation
-// (bug F3: silent, permanent deposit loss). Retrying is safe — a partial save is
-// rolled back by the block_data unique constraint, so a retry re-applies it cleanly.
-// Returns false only on graceful shutdown, leaving the block unsaved to be
-// reprocessed on restart.
-func (s *BlockScanner) saveBlock(block ShardBlockHeader) (BlockEvents, bool) {
-	for {
+// failure instead of skipping to the next one. The tracker has already consumed
+// this block from its in-memory buffer, so an immediate skip would drop it forever;
+// and because incomes are saved atomically WITH the block header (single DB tx),
+// a dropped block means the deposit is never persisted and is unrecoverable even by
+// reconciliation (bug F3: silent, permanent deposit loss). Retrying is safe — the
+// save is one transaction, so a failed attempt commits nothing and a retry re-applies
+// it cleanly.
+//
+// Retries are BOUNDED: a deterministic error (malformed block, a DB invariant
+// violation, or a commit-ambiguity unique-constraint hit where the row already
+// landed) would otherwise wedge this block forever and halt the whole deposit
+// pipeline (and, via waitSync, withdrawals). After the cap we alert loudly and skip,
+// keeping the pipeline alive — a bounded, observable degradation instead of a silent
+// hang. Returns (events, saved, shutdown): saved=true on success; shutdown=true if a
+// graceful stop interrupted the loop (block left unsaved, reprocessed on restart);
+// both false means the block was skipped after exhausting retries.
+func (s *BlockScanner) saveBlock(block ShardBlockHeader) (BlockEvents, bool, bool) {
+	for attempt := 1; ; attempt++ {
 		if s.gracefulShutdown.Load() {
-			return BlockEvents{}, false
+			return BlockEvents{}, false, true
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*15)
 		events, err := s.computeBlockEvents(ctx, block)
@@ -145,9 +163,17 @@ func (s *BlockScanner) saveBlock(block ShardBlockHeader) (BlockEvents, bool) {
 		}
 		cancel()
 		if err == nil {
-			return events, true
+			return events, true, false
 		}
-		log.Errorf("save block (seqno %d) error: %v, retrying same block", block.BlockIDExt.SeqNo, err)
+		if attempt >= maxBlockSaveAttempts {
+			text := fmt.Sprintf("giving up on block seqno %d after %d attempts: %v — SKIPPING (deposits in this block need reconciliation)",
+				block.BlockIDExt.SeqNo, attempt, err)
+			audit.Log(audit.Error, "block_scanner", "block_save_giving_up", text)
+			log.Errorf("%s", text)
+			return BlockEvents{}, false, false
+		}
+		log.Errorf("save block (seqno %d) attempt %d/%d error: %v, retrying same block",
+			block.BlockIDExt.SeqNo, attempt, maxBlockSaveAttempts, err)
 		time.Sleep(time.Second * 5)
 	}
 }
