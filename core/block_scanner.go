@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/big"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gobicycle/bicycle/audit"
@@ -21,12 +22,13 @@ import (
 )
 
 type BlockScanner struct {
-	db           storage
-	blockchain   blockchain
-	shard        byte
-	tracker      blocksTracker
-	wg           *sync.WaitGroup
-	notificators []Notificator
+	db               storage
+	blockchain       blockchain
+	shard            byte
+	tracker          blocksTracker
+	wg               *sync.WaitGroup
+	notificators     []Notificator
+	gracefulShutdown atomic.Bool
 }
 
 type transactions struct {
@@ -98,42 +100,68 @@ func (s *BlockScanner) Start() {
 			log.Printf("Block scanner stopped")
 			break
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second*15)
-		err = s.processBlock(ctx, block)
-		if err != nil {
-			log.Errorf("block processing error: %v", err)
-			cancel()
-			time.Sleep(time.Second * 5)
-			continue
+
+		events, saved := s.saveBlock(block)
+		if !saved {
+			// Graceful shutdown interrupted the save-retry loop. The block is left
+			// unsaved, but the tracker resumes from the last SAVED block on restart
+			// (GetLastSavedBlockID seeding in main.go), so it is reprocessed — not lost.
+			log.Printf("Block scanner stopped")
+			break
 		}
-		cancel()
+		// The block is durably saved. Notifications are best-effort: a delivery
+		// failure is recoverable by the backend deposit reconciler, which reads the
+		// persisted incomes. Never re-save here — the block_data unique constraint
+		// would abort a second save of the same block.
+		if err := s.pushNotifications(events); err != nil {
+			log.Errorf("push notifications error (block saved, backend reconciler recovers deposits): %v", err)
+		}
 	}
 }
 
 func (s *BlockScanner) Stop() {
+	s.gracefulShutdown.Store(true)
 	s.tracker.Stop()
 }
 
-func (s *BlockScanner) processBlock(ctx context.Context, block ShardBlockHeader) error {
+// saveBlock durably persists a block's parsed events, retrying the SAME block on
+// transient failure instead of skipping to the next one. The tracker has already
+// consumed this block from its in-memory buffer, so a skip would drop it forever;
+// and because incomes are saved atomically WITH the block header, a dropped block
+// means the deposit is never persisted and is unrecoverable even by reconciliation
+// (bug F3: silent, permanent deposit loss). Retrying is safe — a partial save is
+// rolled back by the block_data unique constraint, so a retry re-applies it cleanly.
+// Returns false only on graceful shutdown, leaving the block unsaved to be
+// reprocessed on restart.
+func (s *BlockScanner) saveBlock(block ShardBlockHeader) (BlockEvents, bool) {
+	for {
+		if s.gracefulShutdown.Load() {
+			return BlockEvents{}, false
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*15)
+		events, err := s.computeBlockEvents(ctx, block)
+		if err == nil {
+			err = s.db.SaveParsedBlockData(ctx, events)
+		}
+		cancel()
+		if err == nil {
+			return events, true
+		}
+		log.Errorf("save block (seqno %d) error: %v, retrying same block", block.BlockIDExt.SeqNo, err)
+		time.Sleep(time.Second * 5)
+	}
+}
+
+func (s *BlockScanner) computeBlockEvents(ctx context.Context, block ShardBlockHeader) (BlockEvents, error) {
 	txIDs, err := s.blockchain.GetTransactionIDsFromBlock(ctx, block.BlockIDExt)
 	if err != nil {
-		return err
+		return BlockEvents{}, err
 	}
 	filteredTXs, err := s.filterTXs(ctx, block.BlockIDExt, txIDs)
 	if err != nil {
-		return err
+		return BlockEvents{}, err
 	}
-	e, err := s.processTXs(ctx, filteredTXs, block)
-	if err != nil {
-		return err
-	}
-	err = s.db.SaveParsedBlockData(ctx, e)
-	if err != nil {
-		return err
-	}
-	// Push notifications after saving to the database.
-	// Prevents duplicate sending on restart, but may result in lost notifications.
-	return s.pushNotifications(e)
+	return s.processTXs(ctx, filteredTXs, block)
 }
 
 func (s *BlockScanner) pushNotifications(e BlockEvents) error {

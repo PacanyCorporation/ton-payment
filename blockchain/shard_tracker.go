@@ -2,6 +2,7 @@ package blockchain
 
 import (
 	"context"
+	"fmt"
 	"github.com/gobicycle/bicycle/core"
 	log "github.com/sirupsen/logrus"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -120,7 +121,11 @@ func (s *ShardTracker) loadShardBlocksBatch(masterBlockID *ton.BlockIDExt) (bool
 		break
 	}
 	s.infoCounter = 0
-	batch, exit, err := s.getShardBlocksRecursively(filterByShard(shards, s.shard), nil)
+	shardBlock, err := filterByShard(shards, s.shard)
+	if err != nil {
+		return false, err
+	}
+	batch, exit, err := s.getShardBlocksRecursively(shardBlock, nil)
 	if err != nil {
 		return false, err
 	}
@@ -178,27 +183,33 @@ func (s *ShardTracker) getShardBlocksRecursively(i *ton.BlockIDExt, batch []core
 	return s.getShardBlocksRecursively(h.Parent, batch)
 }
 
-func isInShard(blockShardPrefix uint64, shard byte) bool {
+// isInShard returns an error instead of crashing the process on malformed shard
+// data: this runs on every scanned block, and a data-dependent log.Fatalf here
+// took down the whole scanner+withdrawal process (shared wg.Wait).
+func isInShard(blockShardPrefix uint64, shard byte) (bool, error) {
 	if blockShardPrefix == 0 {
-		log.Fatalf("invalid shard_prefix")
+		return false, fmt.Errorf("invalid shard_prefix")
 	}
 	prefixLen := 64 - 1 - bits.TrailingZeros64(blockShardPrefix) // without one insignificant bit
 	if prefixLen > 8 {
-		log.Fatalf("more than 256 shards is not supported")
+		return false, fmt.Errorf("more than 256 shards is not supported")
 	}
 	res := (uint64(shard) << (64 - 8)) ^ blockShardPrefix
 
-	return bits.LeadingZeros64(res) >= prefixLen
+	return bits.LeadingZeros64(res) >= prefixLen, nil
 }
 
-func filterByShard(headers []*ton.BlockIDExt, shard byte) *ton.BlockIDExt {
+func filterByShard(headers []*ton.BlockIDExt, shard byte) (*ton.BlockIDExt, error) {
 	for _, h := range headers {
-		if isInShard(uint64(h.Shard), shard) {
-			return h
+		in, err := isInShard(uint64(h.Shard), shard)
+		if err != nil {
+			return nil, err
+		}
+		if in {
+			return h, nil
 		}
 	}
-	log.Fatalf("must be at least one suitable shard block")
-	return nil
+	return nil, fmt.Errorf("must be at least one suitable shard block")
 }
 
 func convertBlockToShardHeader(block *tlb.Block, info *ton.BlockIDExt, shard byte) (core.ShardBlockHeader, error) {
@@ -206,7 +217,10 @@ func convertBlockToShardHeader(block *tlb.Block, info *ton.BlockIDExt, shard byt
 	if err != nil {
 		return core.ShardBlockHeader{}, err
 	}
-	parent := filterByShard(parents, shard)
+	parent, err := filterByShard(parents, shard)
+	if err != nil {
+		return core.ShardBlockHeader{}, err
+	}
 	return core.ShardBlockHeader{
 		NotMaster:  block.BlockInfo.NotMaster,
 		GenUtime:   block.BlockInfo.GenUtime,

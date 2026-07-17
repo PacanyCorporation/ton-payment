@@ -60,10 +60,17 @@ var Config = struct {
 	WebhookToken             string `env:"WEBHOOK_TOKEN"`
 	AllowableLaggingSec      int    `env:"ALLOWABLE_LAG"`
 	ForwardTonAmount         int    `env:"FORWARD_TON_AMOUNT" envDefault:"1"`
-	Jettons                  map[string]Jetton
-	Ton                      Cutoffs
-	ColdWallet               *address.Address
-	BlockchainConfig         *boc.Cell
+	// ExternalWithdrawalsEnabled is a kill-switch for broadcasting external
+	// withdrawals. Withdrawal idempotency lives only in the processing/processed DB
+	// flags, so a point-in-time restore that predates a broadcast resets them and
+	// the round re-sends a fresh on-chain message — a double payout (bug F2/M6).
+	// After ANY DB restore, set this to false, reconcile withdrawal state against the
+	// chain, then re-enable. Default true keeps normal restarts unaffected.
+	ExternalWithdrawalsEnabled bool `env:"EXTERNAL_WITHDRAWALS_ENABLED" envDefault:"true"`
+	Jettons                    map[string]Jetton
+	Ton                        Cutoffs
+	ColdWallet                 *address.Address
+	BlockchainConfig           *boc.Cell
 }{}
 
 type Jetton struct {

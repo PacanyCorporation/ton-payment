@@ -196,12 +196,15 @@ func initJettonHotWallet(
 	return res, nil
 }
 
-func buildComment(comment string) *cell.Cell {
+// buildComment returns an error instead of crashing the whole process (log.Fatalf
+// → os.Exit) on a comment that will not fit a cell. This runs on the withdrawal
+// hot path, so one bad task must be skippable, not fatal to the money processor.
+func buildComment(comment string) (*cell.Cell, error) {
 	root := cell.BeginCell().MustStoreUInt(0, 32)
 	if err := root.StoreStringSnake(comment); err != nil {
-		log.Fatalf("memo must fit into cell")
+		return nil, fmt.Errorf("memo must fit into cell: %w", err)
 	}
-	return root.EndCell()
+	return root.EndCell(), nil
 }
 
 func LoadComment(cell *cell.Cell) string {
@@ -229,7 +232,11 @@ func WithdrawTONs(ctx context.Context, from, to *wallet.Wallet, comment string) 
 	}
 	var body *cell.Cell
 	if comment != "" {
-		body = buildComment(comment)
+		var err error
+		body, err = buildComment(comment)
+		if err != nil {
+			return err
+		}
 	}
 	return from.Send(ctx, &wallet.Message{
 		Mode: 128 + 32, // 128 + 32 send all and destroy
@@ -254,7 +261,7 @@ func WithdrawJettons(
 	if from == nil || to == nil || to.Address() == nil {
 		return fmt.Errorf("nil wallet")
 	}
-	body := MakeJettonTransferMessage(
+	body, err := MakeJettonTransferMessage(
 		to.Address(),
 		to.Address(),
 		amount.BigInt(),
@@ -263,6 +270,9 @@ func WithdrawJettons(
 		comment,
 		"",
 	)
+	if err != nil {
+		return err
+	}
 	return from.Send(ctx, &wallet.Message{
 		Mode: 128 + 32, // 128 + 32 send all and destroy
 		InternalMessage: &tlb.InternalMessage{
@@ -282,18 +292,22 @@ func MakeJettonTransferMessage(
 	queryId int64,
 	comment string,
 	binaryComment string,
-) *cell.Cell {
+) (*cell.Cell, error) {
 
 	forwardPayload := cell.BeginCell().EndCell()
 
 	if binaryComment != "" {
 		c, err := decodeBinaryComment(binaryComment)
 		if err != nil {
-			log.Fatalf("decode binary comment error : %s", err.Error())
+			return nil, fmt.Errorf("decode binary comment: %w", err)
 		}
 		forwardPayload = c
 	} else if comment != "" {
-		forwardPayload = buildComment(comment)
+		c, err := buildComment(comment)
+		if err != nil {
+			return nil, err
+		}
+		forwardPayload = c
 	}
 
 	payload, err := tlb.ToCell(jetton.TransferPayload{
@@ -307,10 +321,10 @@ func MakeJettonTransferMessage(
 	})
 
 	if err != nil {
-		log.Fatalf("jetton transfer message serialization error: %s", err.Error())
+		return nil, fmt.Errorf("jetton transfer message serialization: %w", err)
 	}
 
-	return payload
+	return payload, nil
 }
 
 // decodeBinaryComment implements decoding of hex string and put it into cell with TLB scheme:
@@ -341,7 +355,7 @@ func decodeBinaryComment(comment string) (*cell.Cell, error) {
 	return cell.FromBOC(b)
 }
 
-func BuildTonWithdrawalMessage(t ExternalWithdrawalTask) *wallet.Message {
+func BuildTonWithdrawalMessage(t ExternalWithdrawalTask) (*wallet.Message, error) {
 
 	internalMessage := tlb.InternalMessage{
 		IHRDisabled: true,
@@ -353,11 +367,15 @@ func BuildTonWithdrawalMessage(t ExternalWithdrawalTask) *wallet.Message {
 	if t.BinaryComment != "" {
 		c, err := decodeBinaryComment(t.BinaryComment)
 		if err != nil {
-			log.Fatalf("decode binary comment error : %s", err.Error())
+			return nil, fmt.Errorf("decode binary comment: %w", err)
 		}
 		internalMessage.Body = c
 	} else if t.Comment != "" {
-		internalMessage.Body = buildComment(t.Comment)
+		c, err := buildComment(t.Comment)
+		if err != nil {
+			return nil, err
+		}
+		internalMessage.Body = c
 	} else {
 		internalMessage.Body = cell.BeginCell().EndCell()
 	}
@@ -365,16 +383,16 @@ func BuildTonWithdrawalMessage(t ExternalWithdrawalTask) *wallet.Message {
 	return &wallet.Message{
 		Mode:            3,
 		InternalMessage: &internalMessage,
-	}
+	}, nil
 }
 
 func BuildJettonWithdrawalMessage(
 	t ExternalWithdrawalTask,
 	highloadWallet *wallet.Wallet,
 	fromJettonWallet *address.Address,
-) *wallet.Message {
+) (*wallet.Message, error) {
 
-	body := MakeJettonTransferMessage(
+	body, err := MakeJettonTransferMessage(
 		t.Destination.ToTonutilsAddressStd(0),
 		highloadWallet.Address(),
 		t.Amount.BigInt(),
@@ -383,6 +401,9 @@ func BuildJettonWithdrawalMessage(
 		t.Comment,
 		t.BinaryComment,
 	)
+	if err != nil {
+		return nil, err
+	}
 
 	return &wallet.Message{
 		Mode: 3,
@@ -393,7 +414,7 @@ func BuildJettonWithdrawalMessage(
 			Amount:      config.JettonTransferTonAmount,
 			Body:        body,
 		},
-	}
+	}, nil
 }
 
 func BuildJettonProxyWithdrawalMessage(
@@ -402,8 +423,8 @@ func BuildJettonProxyWithdrawalMessage(
 	forwardAmount tlb.Coins,
 	amount *big.Int,
 	comment string,
-) *wallet.Message {
-	jettonTransferPayload := MakeJettonTransferMessage(
+) (*wallet.Message, error) {
+	jettonTransferPayload, err := MakeJettonTransferMessage(
 		tonWallet,
 		tonWallet,
 		amount,
@@ -412,10 +433,13 @@ func BuildJettonProxyWithdrawalMessage(
 		comment,
 		"",
 	)
+	if err != nil {
+		return nil, err
+	}
 
 	msg, err := tlb.ToCell(proxy.BuildMessage(jettonWallet, jettonTransferPayload))
 	if err != nil {
-		log.Fatalf("build proxy message cell error: %v", err)
+		return nil, fmt.Errorf("build proxy message cell: %w", err)
 	}
 	body := cell.BeginCell().MustStoreRef(msg).EndCell()
 	return &wallet.Message{
@@ -428,17 +452,21 @@ func BuildJettonProxyWithdrawalMessage(
 			Body:        body,
 			StateInit:   proxy.StateInit(),
 		},
-	}
+	}, nil
 }
 
 func buildJettonProxyServiceTonWithdrawalMessage(
 	proxy JettonProxy,
 	tonWallet *address.Address,
 	memo uuid.UUID,
-) *wallet.Message {
-	msg, err := tlb.ToCell(proxy.BuildMessage(tonWallet, buildComment(memo.String())))
+) (*wallet.Message, error) {
+	comment, err := buildComment(memo.String())
 	if err != nil {
-		log.Fatalf("build proxy message cell error: %v", err)
+		return nil, err
+	}
+	msg, err := tlb.ToCell(proxy.BuildMessage(tonWallet, comment))
+	if err != nil {
+		return nil, fmt.Errorf("build proxy message cell: %w", err)
 	}
 	body := cell.BeginCell().MustStoreRef(msg).EndCell()
 	return &wallet.Message{
@@ -451,14 +479,18 @@ func buildJettonProxyServiceTonWithdrawalMessage(
 			Body:        body,
 			StateInit:   proxy.StateInit(),
 		},
-	}
+	}, nil
 }
 
 func buildTonFillMessage(
 	to *address.Address,
 	amount tlb.Coins,
 	memo uuid.UUID,
-) *wallet.Message {
+) (*wallet.Message, error) {
+	body, err := buildComment(memo.String())
+	if err != nil {
+		return nil, err
+	}
 	return &wallet.Message{
 		Mode: 3,
 		InternalMessage: &tlb.InternalMessage{
@@ -466,7 +498,7 @@ func buildTonFillMessage(
 			Bounce:      false,
 			DstAddr:     to,
 			Amount:      amount,
-			Body:        buildComment(memo.String()),
+			Body:        body,
 		},
-	}
+	}, nil
 }

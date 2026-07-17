@@ -81,6 +81,14 @@ func (p *WithdrawalsProcessor) startWithdrawalsProcessor() {
 			break
 		}
 		time.Sleep(config.ExternalWithdrawalPeriod)
+		// Kill-switch (F2/M6): after a DB restore the processing/processed flags may
+		// have been rolled back, so broadcasting would re-send already-settled
+		// withdrawals (double payout). An operator sets EXTERNAL_WITHDRAWALS_ENABLED
+		// false to halt broadcasting until withdrawal state is reconciled with chain.
+		if !config.Config.ExternalWithdrawalsEnabled {
+			log.Warnf("external withdrawals disabled (EXTERNAL_WITHDRAWALS_ENABLED=false), skipping round")
+			continue
+		}
 		// A transient DB/RPC error must not crash the whole processor: log and
 		// retry next round. Withdrawals persisted this round carry a TTL, so an
 		// interrupted round is recovered by the expiration processor.
@@ -213,10 +221,18 @@ func (p *WithdrawalsProcessor) buildWithdrawalMessages(ctx context.Context) (wit
 				fmt.Sprintf("withdrawal task to internal %s address %s", t, w.Destination.ToUserFormat()))
 			continue
 		}
+		// Build the message BEFORE reserving balance so a malformed task (e.g. bad
+		// binary comment) is skipped without needing to roll back the reservation,
+		// and — crucially — without crashing the whole withdrawal round. A later
+		// round retries; funds are neither sent nor lost here.
+		msg, err := p.buildExternalWithdrawalMessage(w)
+		if err != nil {
+			log.Errorf("build external withdrawal message (query_id %d): %v, skipping", w.QueryID, err)
+			continue
+		}
 		if decreaseBalances(balances, w.Currency, w.Amount.BigInt()) {
 			continue
 		}
-		msg := p.buildExternalWithdrawalMessage(w)
 		res.Messages = append(res.Messages, msg)
 		res.External = append(res.External, w)
 	}
@@ -280,7 +296,7 @@ func (p *WithdrawalsProcessor) buildJettonInternalWithdrawalMessage(
 		if err != nil {
 			return nil, uuid.UUID{}, err
 		}
-		msg := BuildJettonProxyWithdrawalMessage(
+		msg, err := BuildJettonProxyWithdrawalMessage(
 			*proxy,
 			jettonWalletAddress,
 			p.wallets.TonHotWallet.Address(),
@@ -288,6 +304,9 @@ func (p *WithdrawalsProcessor) buildJettonInternalWithdrawalMessage(
 			balance,
 			memo.String(),
 		)
+		if err != nil {
+			return nil, uuid.UUID{}, err
+		}
 		return []*wallet.Message{msg}, memo, nil
 	}
 	return []*wallet.Message{}, uuid.UUID{}, nil
@@ -348,7 +367,10 @@ func (p *WithdrawalsProcessor) buildServiceFilling(
 			Task:      task,
 		}, nil
 	}
-	msg := buildTonFillMessage(deposit, config.JettonTransferTonAmount, task.Memo)
+	msg, err := buildTonFillMessage(deposit, config.JettonTransferTonAmount, task.Memo)
+	if err != nil {
+		return nil, serviceWithdrawal{}, err
+	}
 	task.JettonAmount = NewCoins(jettonBalance)
 	return []*wallet.Message{msg}, serviceWithdrawal{
 		TonAmount: ZeroCoins(),
@@ -382,7 +404,10 @@ func (p *WithdrawalsProcessor) buildServiceTonWithdrawal(
 			fmt.Sprintf("zero balance of TONs on proxy address %s", TonutilsAddressToUserFormat(proxy.address)))
 		return nil, res, nil
 	}
-	msg := buildJettonProxyServiceTonWithdrawalMessage(*proxy, p.wallets.TonHotWallet.Address(), task.Memo)
+	msg, err := buildJettonProxyServiceTonWithdrawalMessage(*proxy, p.wallets.TonHotWallet.Address(), task.Memo)
+	if err != nil {
+		return nil, serviceWithdrawal{}, err
+	}
 	return []*wallet.Message{msg}, res, nil
 }
 
@@ -434,7 +459,7 @@ func (p *WithdrawalsProcessor) buildServiceJettonWithdrawal(
 		Task:      task,
 	}
 
-	msg := BuildJettonProxyWithdrawalMessage(
+	msg, err := BuildJettonProxyWithdrawalMessage(
 		*proxy,
 		jettonWallet,
 		p.wallets.TonHotWallet.Address(),
@@ -442,10 +467,13 @@ func (p *WithdrawalsProcessor) buildServiceJettonWithdrawal(
 		jettonBalance,
 		task.Memo.String(),
 	)
+	if err != nil {
+		return nil, serviceWithdrawal{}, err
+	}
 	return []*wallet.Message{msg}, res, nil
 }
 
-func (p *WithdrawalsProcessor) buildExternalWithdrawalMessage(wt ExternalWithdrawalTask) *wallet.Message {
+func (p *WithdrawalsProcessor) buildExternalWithdrawalMessage(wt ExternalWithdrawalTask) (*wallet.Message, error) {
 	if wt.Currency == TonSymbol {
 		return BuildTonWithdrawalMessage(wt)
 	}

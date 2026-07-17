@@ -385,7 +385,11 @@ func Test_NextBlock(t *testing.T) {
 		if err != nil {
 			t.Fatal("get next block err: ", err)
 		}
-		if !isInShard(uint64(h.Shard), shard) {
+		in, err := isInShard(uint64(h.Shard), shard)
+		if err != nil {
+			t.Fatal("isInShard err: ", err)
+		}
+		if !in {
 			t.Fatal("next block not in shard")
 		}
 	}

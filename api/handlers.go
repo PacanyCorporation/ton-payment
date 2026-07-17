@@ -679,6 +679,22 @@ func convertWithdrawal(w WithdrawalRequest) (core.WithdrawalRequest, error) {
 		return core.WithdrawalRequest{}, fmt.Errorf("amount must be > 0")
 	}
 
+	// F1 defense-in-depth: ton-payment keeps no per-user balance/ledger and trusts
+	// the backend's shared bearer token fully. Cap any single withdrawal at the
+	// hot-wallet ceiling for its currency (config, nano) so a leaked token or a
+	// backend bug cannot request in one call more than the float the hot wallet is
+	// designed to hold. Does NOT replace token rotation or a per-user ceiling.
+	var maxPerRequest *big.Int
+	if w.Currency == core.TonSymbol {
+		maxPerRequest = config.Config.Ton.HotWalletMax
+	} else if j, ok := config.Config.Jettons[w.Currency]; ok {
+		maxPerRequest = j.HotWalletMaxCutoff
+	}
+	if maxPerRequest != nil && maxPerRequest.Sign() > 0 &&
+		w.Amount.Cmp(decimal.NewFromBigInt(maxPerRequest, 0)) == 1 {
+		return core.WithdrawalRequest{}, fmt.Errorf("amount exceeds max allowed per withdrawal")
+	}
+
 	if w.Comment != "" && w.BinaryComment != "" {
 		return core.WithdrawalRequest{}, fmt.Errorf("only one type of comment can be specified (comment OR binary comment)")
 	}
