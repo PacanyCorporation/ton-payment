@@ -3,9 +3,13 @@ package core
 import (
 	"context"
 	"fmt"
+	"strings"
+
+	"github.com/gobicycle/bicycle/alerts"
 	"github.com/gobicycle/bicycle/audit"
 	"github.com/gobicycle/bicycle/config"
 	"github.com/gofrs/uuid"
+	"github.com/shopspring/decimal"
 	log "github.com/sirupsen/logrus"
 	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/tlb"
@@ -23,6 +27,20 @@ type WithdrawalsProcessor struct {
 	coldWallet       *address.Address
 	wg               *sync.WaitGroup
 	gracefulShutdown atomic.Bool
+	alerter          *alerts.Publisher
+	// lastStuckAlert debounces the stuck-withdrawal alert (rounds run every 80s;
+	// without it the alert would fire every round while the hot wallet is dry).
+	// Touched only by the single external-withdrawals goroutine.
+	lastStuckAlert time.Time
+}
+
+// stuckWithdrawal is one external withdrawal skipped this round because the hot
+// wallet balance does not cover it.
+type stuckWithdrawal struct {
+	QueryID  int64
+	Currency string
+	Need     *big.Int
+	Have     *big.Int
 }
 
 type internalWithdrawal struct {
@@ -49,6 +67,7 @@ func NewWithdrawalsProcessor(
 	bc blockchain,
 	wallets Wallets,
 	coldWallet *address.Address,
+	alerter *alerts.Publisher,
 ) *WithdrawalsProcessor {
 	w := &WithdrawalsProcessor{
 		db:         db,
@@ -56,6 +75,7 @@ func NewWithdrawalsProcessor(
 		wallets:    wallets,
 		coldWallet: coldWallet,
 		wg:         wg,
+		alerter:    alerter,
 	}
 	return w
 }
@@ -143,6 +163,7 @@ func (p *WithdrawalsProcessor) buildWithdrawalMessages(ctx context.Context) (wit
 	var (
 		usedAddresses []Address
 		res           withdrawals
+		stuck         []stuckWithdrawal
 	)
 
 	balances, err := p.getHotWalletBalances(ctx)
@@ -231,11 +252,29 @@ func (p *WithdrawalsProcessor) buildWithdrawalMessages(ctx context.Context) (wit
 			continue
 		}
 		if decreaseBalances(balances, w.Currency, w.Amount.BigInt()) {
+			// Hot wallet lacks enough of this currency (or enough TON for jetton gas)
+			// to cover the withdrawal. It is silently retried every round, which looks
+			// like a wedged withdrawal — log why so the cause (fund the hot wallet) is
+			// visible instead of a silent skip. For a jetton, "have" is the jetton
+			// balance; sending it also needs TON gas in the hot wallet.
+			have := big.NewInt(0)
+			if b, ok := balances[w.Currency]; ok && b != nil {
+				have = new(big.Int).Set(b) // copy: balances map keeps mutating this round
+			}
+			log.Warnf("skipping withdrawal query_id %d: insufficient hot wallet %s (need %s, have %s) — fund the hot wallet",
+				w.QueryID, w.Currency, w.Amount.String(), have.String())
+			stuck = append(stuck, stuckWithdrawal{
+				QueryID:  w.QueryID,
+				Currency: w.Currency,
+				Need:     w.Amount.BigInt(),
+				Have:     have,
+			})
 			continue
 		}
 		res.Messages = append(res.Messages, msg)
 		res.External = append(res.External, w)
 	}
+	p.maybeAlertStuckWithdrawals(stuck)
 	return res, nil
 }
 
@@ -272,6 +311,140 @@ func decreaseBalances(balances map[string]*big.Int, currency string, amount *big
 	balances[currency].Sub(balances[currency], amount)
 	balances[TonSymbol].Sub(balances[TonSymbol], config.JettonTransferTonAmount.Nano())
 	return false
+}
+
+// stuckWithdrawalAlertPeriod is how often the stuck-withdrawal alert repeats
+// while withdrawals stay unfunded (first occurrence alerts immediately).
+const stuckWithdrawalAlertPeriod = time.Hour
+
+// alertDecimals maps currency to on-chain decimals for human-readable alert
+// amounts. ponytail: hardcoded for the currencies we run; unknown jettons fall
+// back to raw units.
+var alertDecimals = map[string]int32{TonSymbol: 9, "USDT": 6}
+
+func fmtAlertAmount(currency string, v *big.Int) string {
+	if d, ok := alertDecimals[currency]; ok {
+		return decimal.NewFromBigInt(v, -d).String() + " " + currency
+	}
+	return v.String() + " " + currency + " (raw)"
+}
+
+// maybeAlertStuckWithdrawals sends a Telegram alert (via the shared alerts
+// stream) when external withdrawals were skipped for lack of hot wallet funds.
+// Debounced to one alert per stuckWithdrawalAlertPeriod. The summary of
+// un-swept deposits needs extra chain reads, so it runs in a goroutine with its
+// own deadline instead of eating the 25s round budget.
+func (p *WithdrawalsProcessor) maybeAlertStuckWithdrawals(stuck []stuckWithdrawal) {
+	if len(stuck) == 0 || !p.alerter.Configured() {
+		return
+	}
+	if time.Since(p.lastStuckAlert) < stuckWithdrawalAlertPeriod {
+		return
+	}
+	p.lastStuckAlert = time.Now()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*60)
+		defer cancel()
+		if err := p.alerter.Send(ctx, alerts.LevelWarn, p.buildStuckAlertText(ctx, stuck)); err != nil {
+			log.Errorf("send stuck withdrawal alert: %v", err)
+		}
+	}()
+}
+
+func (p *WithdrawalsProcessor) buildStuckAlertText(ctx context.Context, stuck []stuckWithdrawal) string {
+	return renderStuckAlert(stuck, p.pendingSweepsSummary(ctx))
+}
+
+// renderStuckAlert is pure so the alert text is unit-testable without mocking
+// chain and DB (sweeps is the pendingSweepsSummary output).
+func renderStuckAlert(stuck []stuckWithdrawal, sweeps string) string {
+	var b strings.Builder
+	b.WriteString("⏳ Вывод завис: не хватает средств на горячем кошельке\n")
+	for _, s := range stuck {
+		b.WriteString(fmt.Sprintf("• query_id %d: нужно %s, на hot %s",
+			s.QueryID, fmtAlertAmount(s.Currency, s.Need), fmtAlertAmount(s.Currency, s.Have)))
+		// decreaseBalances also fails a jetton withdrawal when the wallet holds the
+		// jetton but not the TON gas — "have >= need" would read as nonsense without
+		// naming the real cause.
+		if s.Currency != TonSymbol && s.Have.Cmp(s.Need) >= 0 {
+			b.WriteString(" (не хватает TON на газ)")
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString(sweeps)
+	b.WriteString("→ пополните горячий кошелёк или дождитесь свипа депозитов")
+	return b.String()
+}
+
+// pendingSweepsSummary describes deposit funds that have not reached the hot
+// wallet yet, split by the sweep cutoff: sums above it arrive on their own
+// within minutes, sums below it stay on deposits until topped up — different
+// operator actions. Best-effort: chain/DB errors just shrink the summary.
+func (p *WithdrawalsProcessor) pendingSweepsSummary(ctx context.Context) string {
+	type bucket struct {
+		above, below   *big.Int
+		aboveN, belowN int
+		cutoff         *big.Int
+	}
+	buckets := make(map[string]*bucket)
+	add := func(cur string, balance, cutoff *big.Int) {
+		bk, ok := buckets[cur]
+		if !ok {
+			bk = &bucket{above: big.NewInt(0), below: big.NewInt(0), cutoff: cutoff}
+			buckets[cur] = bk
+		}
+		if balance.Cmp(cutoff) == 1 {
+			bk.above.Add(bk.above, balance)
+			bk.aboveN++
+		} else {
+			bk.below.Add(bk.below, balance)
+			bk.belowN++
+		}
+	}
+
+	tonTasks, err := p.db.GetTonInternalWithdrawalTasks(ctx, 40)
+	if err != nil {
+		log.Errorf("stuck alert: get TON internal withdrawal tasks: %v", err)
+	}
+	for _, t := range tonTasks {
+		balance, state, err := p.bc.GetAccountCurrentState(ctx, t.From.ToTonutilsAddressStd(0))
+		if err != nil || state == tlb.AccountStatusNonExist || balance.Sign() != 1 {
+			continue
+		}
+		add(TonSymbol, balance, config.Config.Ton.Withdrawal)
+	}
+
+	jettonTasks, err := p.db.GetJettonInternalWithdrawalTasks(ctx, nil, 40)
+	if err != nil {
+		log.Errorf("stuck alert: get jetton internal withdrawal tasks: %v", err)
+	}
+	for _, t := range jettonTasks {
+		j, ok := config.Config.Jettons[t.Currency]
+		if !ok {
+			continue
+		}
+		balance, err := p.bc.GetLastJettonBalance(ctx, t.From.ToTonutilsAddressStd(0))
+		if err != nil || balance.Sign() != 1 {
+			continue
+		}
+		add(t.Currency, balance, j.WithdrawalCutoff)
+	}
+
+	if len(buckets) == 0 {
+		return "Несвипнутых депозитов нет — средства нужно завести на горячий кошелёк извне.\n"
+	}
+	var b strings.Builder
+	for cur, bk := range buckets {
+		if bk.aboveN > 0 {
+			b.WriteString(fmt.Sprintf("Ожидает свипа на hot (придёт само): %s на %d депозитах\n",
+				fmtAlertAmount(cur, bk.above), bk.aboveN))
+		}
+		if bk.belowN > 0 {
+			b.WriteString(fmt.Sprintf("Ниже cutoff %s (само НЕ придёт): %s на %d депозитах\n",
+				fmtAlertAmount(cur, bk.cutoff), fmtAlertAmount(cur, bk.below), bk.belowN))
+		}
+	}
+	return b.String()
 }
 
 func (p *WithdrawalsProcessor) buildJettonInternalWithdrawalMessage(

@@ -38,6 +38,12 @@ services:
       SEED: ${SEED}
       TON_CUTOFFS: ${TON_CUTOFFS}
       IS_TESTNET: ${IS_TESTNET}
+      ALERTS_ENABLED: ${ALERTS_ENABLED:-false}
+      ALERTS_REDIS_URL: ${ALERTS_REDIS_URL:-}
+      ALERTS_REDIS_PASSWORD: ${ALERTS_REDIS_PASSWORD:-}
+      ALERTS_REDIS_DB: ${ALERTS_REDIS_DB:-15}
+      ALERTS_PROJECT: ${ALERTS_PROJECT:-durak}
+      ALERTS_STREAM: ${ALERTS_STREAM:-alerts}
     networks:
       - p-network
       - durak-network-dev  # Подключаемся к вашей сети для доступа к durak-postgres

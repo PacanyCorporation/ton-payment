@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/gobicycle/bicycle/alerts"
 	"github.com/gobicycle/bicycle/api"
 	"github.com/gobicycle/bicycle/blockchain"
 	"github.com/gobicycle/bicycle/config"
@@ -93,8 +94,20 @@ func main() {
 
 	blockScanner := core.NewBlockScanner(wg, dbClient, bcClient, wallets.Shard, tracker, notificators)
 
+	// Alerts publisher (operational alerts → shared platform Redis stream the
+	// bot posts to the project's Telegram topic). No-op when not configured.
+	alertsPub := alerts.New(alerts.Config{
+		Enabled:       config.Config.AlertsEnabled,
+		Project:       config.Config.AlertsProject,
+		RedisURL:      config.Config.AlertsRedisURL,
+		RedisPassword: config.Config.AlertsRedisPassword,
+		RedisDB:       config.Config.AlertsRedisDB,
+		Stream:        config.Config.AlertsStream,
+	})
+	defer func() { _ = alertsPub.Close() }()
+
 	withdrawalsProcessor := core.NewWithdrawalsProcessor(
-		wg, dbClient, bcClient, wallets, config.Config.ColdWallet)
+		wg, dbClient, bcClient, wallets, config.Config.ColdWallet, alertsPub)
 	withdrawalsProcessor.Start()
 
 	apiMux := http.NewServeMux()

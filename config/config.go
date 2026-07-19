@@ -67,10 +67,19 @@ var Config = struct {
 	// After ANY DB restore, set this to false, reconcile withdrawal state against the
 	// chain, then re-enable. Default true keeps normal restarts unaffected.
 	ExternalWithdrawalsEnabled bool `env:"EXTERNAL_WITHDRAWALS_ENABLED" envDefault:"true"`
-	Jettons                    map[string]Jetton
-	Ton                        Cutoffs
-	ColdWallet                 *address.Address
-	BlockchainConfig           *boc.Cell
+	// Alerts* point the alerts publisher (alerts package) at the shared platform
+	// Redis stream the platform Telegram bot mirrors into the project's topic.
+	// Disabled/empty URL => alerts are silently skipped (no-op publisher).
+	AlertsEnabled       bool   `env:"ALERTS_ENABLED" envDefault:"false"`
+	AlertsRedisURL      string `env:"ALERTS_REDIS_URL"`
+	AlertsRedisPassword string `env:"ALERTS_REDIS_PASSWORD"`
+	AlertsRedisDB       int    `env:"ALERTS_REDIS_DB" envDefault:"15"`
+	AlertsProject       string `env:"ALERTS_PROJECT" envDefault:"durak"`
+	AlertsStream        string `env:"ALERTS_STREAM" envDefault:"alerts"`
+	Jettons             map[string]Jetton
+	Ton                 Cutoffs
+	ColdWallet          *address.Address
+	BlockchainConfig    *boc.Cell
 }{}
 
 type Jetton struct {
