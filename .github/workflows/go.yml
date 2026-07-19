@@ -43,6 +43,7 @@ jobs:
           install -m 600 /dev/stdin key <<< "${{ secrets.VPS_SSH_KEY }}"
           install -m 644 /dev/stdin known_hosts <<< "${{ secrets.VPS_KNOWN_HOSTS }}"
           REPO=${GITHUB_REPOSITORY#*/}
+          COMMITS_B64=$(jq -c '[(.commits // [])[-20:][] | {sha: (.id[0:7]), msg: ((.message | split("\n")[0])[0:120]), author: .author.name}]' "$GITHUB_EVENT_PATH" | base64 -w0)
           echo "${{ secrets.GITHUB_TOKEN }}" | ssh -i key -o UserKnownHostsFile=known_hosts \
             ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} \
-            "$REPO ${{ github.sha }} ${{ github.actor }}"
+            "$REPO ${{ github.sha }} ${{ github.actor }} $COMMITS_B64"
