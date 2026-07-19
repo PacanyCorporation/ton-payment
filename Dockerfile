@@ -3,6 +3,7 @@ WORKDIR /build-dir
 COPY go.mod .
 COPY go.sum .
 RUN go mod download all
+COPY alerts alerts
 COPY api api
 COPY blockchain blockchain
 COPY cmd cmd
